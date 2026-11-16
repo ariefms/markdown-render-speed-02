@@ -1688,12 +1688,18 @@ function markedMask(src, refs) {
     };
     t = t.replace(re, maskReflink);
   }
-  t = t.replace(MARKED_CODE_OUTSIDE, (n, s, r) =>
-    r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
-  t = t.replace(MARKED_BLOCKSKIP, (n, s, r) => {
-    const o = r ? r.length : 0;
-    return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
-  });
+  // The two replaces below are the hot path: skip each when its trigger
+  // characters are absent (then the regex cannot match at all).
+  if (t.includes('`') || t.includes('\\')) {
+    t = t.replace(MARKED_CODE_OUTSIDE, (n, s, r) =>
+      r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  }
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(MARKED_BLOCKSKIP, (n, s, r) => {
+      const o = r ? r.length : 0;
+      return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+    });
+  }
   return t;
 }
 
@@ -1911,6 +1917,11 @@ function markedResolve(nodes, runs, src, masked, fe, refs) {
       innerNodes.push(nd);
       innerRuns.push({ node: nd, ch, n: innerCloserLeft, orig: innerCloserLeft, pos: innerSrc.length - innerCloserLeft });
     }
+    // resolve the inner content (marked's recursive inlineTokens). The
+    // inner masked source is the corresponding slice of the outer masked
+    // source: a matched span's inner text cannot straddle a code span or
+    // link boundary (its delimiter runs sit outside them), so re-masking
+    // the inner text would give the same string.
     // resolve the inner content (marked's recursive inlineTokens)
     const innerMasked = markedMask(innerSrc, refs);
     const innerFe = markedFe(innerMasked);
