@@ -1642,132 +1642,317 @@ function inlineNodes(src, refs) {
     i++;
   }
   flushText(n);
-  resolveEmphasis(nodes, delims, src);
+  resolveEmphasis(nodes, delims, src, refs);
   return nodes;
 }
 
 
-// Resolve emphasis/delimiter runs with the CommonMark delimiter-stack
-// algorithm (commonmark.js processEmphasis): openers_bottom indexed by
-// (char, can_open, origdelims % 3); on a failed closer the bottom is set
-// to the delimiter BEFORE the closer and a closer that cannot open is
-// removed; the odd-match rule uses ORIGINAL run lengths; delimiters
-// between a matched pair are removed from the stack and can never match
-// again; a closer with delims left is re-processed.
-function resolveEmphasis(nodes, delims, src) {
-  if (delims.length === 0) return;
-  // matched closing delimiters: a matched STRONG closer (count 2)
-  // immediately followed by a word char blocks a later EM closer (count
-  // 1) of the same delimiter char (marked's emStrong quirk: `*a **b**c*`
-  // stays literal, `*a **b** c*` forms em; the block holds even when a
-  // space follows the word run, doc-22/28). It does NOT block a later
-  // strong closer (doc-04/27: `*a *b*c**` forms the outer em with one
-  // `*` of the `**`), and a `**` strong does NOT block a `_` em
-  // (different delimiter char, doc-05/33/37).
-  const matchedClosers = [];
-  const isWordChar = (ch) => /[A-Za-z0-9]/.test(ch);
-  const isBlocked = (found, cur) => {
-    for (const mc of matchedClosers) {
-      if (mc.endPos <= found.pos || mc.endPos >= cur.pos) continue;
-      if (mc.ch !== cur.ch) continue;
-      if (!(mc.count === 2 && cur.orig === 1)) continue;
-      if (!mc.openerPrecededByWs) continue;
-      if (isWordChar(src[mc.endPos])) return true;
-    }
-    return false;
-  };
-  for (let idx = 0; idx < delims.length; idx++) {
-    delims[idx].prev = idx > 0 ? delims[idx - 1] : null;
-    delims[idx].next = idx + 1 < delims.length ? delims[idx + 1] : null;
-    if (delims[idx].orig === undefined) delims[idx].orig = delims[idx].n;
+// Exact GFM regexes from marked 18.1.3 (vendored in the kit), extracted
+// programmatically from Lexer.rules.inline.gfm — do not hand-edit.
+const MARKED_EM_LDELIM = new RegExp("^(?:\\*+(?:((?!\\*)(?!~)[\\p{P}\\p{S}])|([^\\s*]))?)|^_+(?:((?!_)(?!~)[\\p{P}\\p{S}])|([^\\s_]))?", "u");
+const MARKED_EM_RDELIM_AST = new RegExp("^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)(?!~)[\\p{P}\\p{S}](\\*+)(?=[\\s]|$)|(?:[^\\s\\p{P}\\p{S}]|~)(\\*+)(?!\\*)(?=(?!~)[\\s\\p{P}\\p{S}]|$)|(?!\\*)(?!~)[\\s\\p{P}\\p{S}](\\*+)(?=(?:[^\\s\\p{P}\\p{S}]|~))|[\\s](\\*+)(?!\\*)(?=(?!~)[\\p{P}\\p{S}])|(?!\\*)(?!~)[\\p{P}\\p{S}](\\*+)(?!\\*)(?=(?!~)[\\p{P}\\p{S}])|(?:[^\\s\\p{P}\\p{S}]|~)(\\*+)(?=(?:[^\\s\\p{P}\\p{S}]|~))", "gu");
+const MARKED_EM_RDELIM_UND = new RegExp("^[^_*]*?\\*\\*[^_*]*?_[^_*]*?(?=\\*\\*)|[^_]+(?=[^_])|(?!_)[\\p{P}\\p{S}](_+)(?=[\\s]|$)|[^\\s\\p{P}\\p{S}](_+)(?!_)(?=[\\s\\p{P}\\p{S}]|$)|(?!_)[\\s\\p{P}\\p{S}](_+)(?=[^\\s\\p{P}\\p{S}])|[\\s](_+)(?!_)(?=[\\p{P}\\p{S}])|(?!_)[\\p{P}\\p{S}](_+)(?!_)(?=[\\p{P}\\p{S}])", "gu");
+const MARKED_DEL_LDELIM = new RegExp("^~~?(?:((?!~)[\\p{P}\\p{S}])|[^\\s~])", "u");
+const MARKED_DEL_RDELIM = new RegExp("^[^~]+(?=[^~])|(?!~)[\\p{P}\\p{S}](~~?)(?=[\\s]|$)|[^\\s\\p{P}\\p{S}](~~?)(?!~)(?=[\\s\\p{P}\\p{S}]|$)|(?!~)[\\s\\p{P}\\p{S}](~~?)(?=[^\\s\\p{P}\\p{S}])|[\\s](~~?)(?!~)(?=[\\p{P}\\p{S}])|(?!~)[\\p{P}\\p{S}](~~?)(?!~)(?=[\\p{P}\\p{S}])|[^\\s\\p{P}\\p{S}](~~?)(?=[^\\s\\p{P}\\p{S}])", "gu");
+const MARKED_CODE_OUTSIDE = new RegExp("(`+)(?:[^`]|[^`][\\s\\S]*?[^`])\\1(?!`)|`+|\\\\([\\p{P}\\p{S}])", "gu");
+const MARKED_BLOCKSKIP = new RegExp("\\[(?:[^\\[\\]`]|(?<a>`+)[^`]+\\k<a>(?!`))*?\\]\\((?:\\\\[\\s\\S]|[^\\\\\\(\\)]|\\((?:\\\\[\\s\\S]|[^\\\\\\(\\)])*\\))*\\)|(?<!`)()(?<b>`+)[^`]+\\k<b>(?!`)|<(?! )[^<>]*?>", "g");
+const MARKED_REFLINK_SEARCH = new RegExp("!?\\[((?:[^\\[\\]\\\\`]*(?:\\[(?:\\[(?:\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\\]))){0,999}?[^\\[\\]\\\\`]*?)\\]\\[((?!\\s*\\])(?:\\\\[\\s\\S]|[^\\[\\]\\\\]){1,999})\\]|!?\\[((?!\\s*\\])(?:\\\\[\\s\\S]|[^\\[\\]\\\\]){1,999})\\](?:\\[\\])?(?!\\()", "g");
+const MARKED_PUNCT = new RegExp("^((?![*_])[\\s\\p{P}\\p{S}])", "u");
+const MARKED_LINK = new RegExp("^!?\\[((?:\\[(?:\\[(?:\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\\])|[^\\[\\]\\\\`])*?)\\]\\([ \\t\\n]*(<(?:\\\\.|[^\\n<>\\\\])+>|[^ \\t\\n\\x00-\\x1f]+|(?=\\)))(?:(?:[ \\t]+(?:\\n[ \\t]*)?|\\n[ \\t]*)(\"(?:\\\\[\\s\\S]|[^\"\\\\])*\"|'(?:\\\\[\\s\\S]|[^'\\\\])*'|\\((?:\\\\[\\s\\S]|[^)\\\\])*\\)))?[ \\t\\n]*\\)", "");
+const MARKED_ALNUM = /[\p{L}\p{N}]/u;
+
+// ---- marked-faithful emphasis (port of marked 18.1.3 emStrong + del) ----
+// The CommonMark delimiter stack could not reproduce marked's regex-based
+// emStrong: code spans and failed links affect emphasis through a masked
+// source, and a lone `*` opener can steal a `**` closer (rule-of-3 / m-f
+// bookkeeping). This port runs marked's exact algorithms over the runs
+// collected by inlineNodes, with the same masking and fe limits.
+
+// Length-preserving mask of the inline source for emphasis scanning
+// (marked Lexer#n): hides link labels, code spans, HTML and escaped
+// punctuation so the delimiter regexes only see delimiters that can pair.
+function markedMask(src, refs) {
+  let t = src;
+  if (refs && refs.size > 0 && src.includes('[')) {
+    const re = MARKED_REFLINK_SEARCH;
+    const maskReflink = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!refs.has(normLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const inner = r.slice(1, o - 1);
+        if (markedLinkInText(inner, refs)) {
+          return '[' + inner.replace(re, maskReflink) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+        }
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(re, maskReflink);
   }
-  const bottom = new Map();
-  const bottomKey = (d) => d.ch + '|' + (d.canOpen ? 1 : 0) + '|' + (d.orig % 3);
-  const removeDelim = (d) => {
+  t = t.replace(MARKED_CODE_OUTSIDE, (n, s, r) =>
+    r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(MARKED_BLOCKSKIP, (n, s, r) => {
+    const o = r ? r.length : 0;
+    return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+  });
+  return t;
+}
+
+function markedLinkInText(e, refs) {
+  if (!e.includes('[')) return false;
+  for (const n of e.matchAll(MARKED_BLOCKSKIP)) {
+    if (MARKED_LINK.test(n[0]) && e.charAt(n.index - 1) !== '!') return true;
+  }
+  for (const n of e.matchAll(MARKED_REFLINK_SEARCH)) {
+    const s = n[0], r = s.lastIndexOf('[');
+    if (!(s.charAt(0) === '!' || !refs.has(normLabel(s.slice(r + 1, -1)))) &&
+        !(r > 1 && markedLinkInText(s.slice(1, r - 1), refs))) return true;
+  }
+  return false;
+}
+
+// marked's fe(): last possible closer index per delimiter char in the
+// masked source (a run counts only when preceded by a non-whitespace char).
+function markedFe(masked) {
+  const em = { '*': -1, '_': -1 };
+  let del = -1;
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    const r = masked[s];
+    if (r !== '*' && r !== '_' && r !== '~') continue;
+    const o = s === 0 ? ' ' : masked[s - 1];
+    let i = s + 1;
+    while (i < n && masked[i] === r) i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') {
+      if (r === '~') del = s; else em[r] = s;
+    }
+    s = i - 1;
+  }
+  return { em, del };
+}
+
+// marked Tokenizer.emStrong, returning the match geometry instead of tokens.
+// src/masked are the full (same-length) strings; ap is the attempt position
+// (start of the run being tried); prevChar is marked's `r`.
+function markedEmStrong(src, masked, fe, ap, prevChar) {
+  const e = src.slice(ap);
+  MARKED_EM_LDELIM.lastIndex = 0;
+  const s = MARKED_EM_LDELIM.exec(e);
+  if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
+  const r = s[0][0];
+  let n = prevChar;
+  const o = n === r;
+  const i = masked.length - e.length; // == ap
+  let l = i;
+  while (l > 0 && masked[l - 1] === r) l--;
+  const pCps = [...masked.slice(Math.max(0, l - 2), l)];
+  const p = pCps.length ? pCps[pCps.length - 1] : '';
+  const h = p === '*' || p === '_' || MARKED_PUNCT.test(p);
+  if (l < i) n = p;
+  const u = l < i ? h : MARKED_PUNCT.test(n);
+  if (s[4] && MARKED_ALNUM.test(n)) return null;
+  const d = s[1] || s[3] || '';
+  if (!(!d || !n || u)) return null;
+  const k = [...s[0]].length - 1;
+  let m = k, f = 0;
+  const y = i - l + k;
+  const R = !!p.trim() && (!!d || (r === '*' && !h));
+  if (r !== '*' && r !== '_') return null;
+  const A = r === '*' ? MARKED_EM_RDELIM_AST : MARKED_EM_RDELIM_UND;
+  const v = fe.em[r];
+  const Q = i + k;
+  if (v < Q) return null;
+  const scan = masked.slice(i + k);
+  const ee = v - Q;
+  A.lastIndex = 0;
+  let s2;
+  while ((s2 = A.exec(scan)) !== null && !(s2.index > ee)) {
+    const g = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
+    if (!g) continue;
+    const b0 = [...g].length;
+    if (s2[3] || s2[4]) { m += b0; continue; }
+    if (s2[5] || s2[6] || R) {
+      if (o && (s2[5] || s2[6])) break;
+      if (y % 3 && (y + b0) % 3 === 0) { f += b0; continue; }
+    }
+    m -= b0;
+    if (m > 0) continue;
+    const b = Math.min(b0, b0 + m + f);
+    const te = [...s2[0]][0].length;
+    const closerStart = ap + k + s2.index + te;
+    const use = Math.min(k, b) % 2 === 1 ? 1 : 2;
+    return {
+      type: use === 1 ? 'em' : 'strong', ch: r,
+      start: ap, end: closerStart + b, use,
+      innerStart: ap + use, innerEnd: closerStart + b - use,
+      closerStart, closerLen: b, openerLen: k, attLen: k,
+    };
+  }
+  return null;
+}
+
+// marked Tokenizer.del, same shape as emStrong.
+function markedDel(src, masked, fe, ap, prevChar) {
+  const e = src.slice(ap);
+  MARKED_DEL_LDELIM.lastIndex = 0;
+  const s = MARKED_DEL_LDELIM.exec(e);
+  if (!s) return null;
+  if (!((s[1] || '') || !prevChar || MARKED_PUNCT.test(prevChar))) return null;
+  const o = [...s[0]].length - 1;
+  let p = o;
+  const u = fe.del;
+  const d = ap + o;
+  if (u < d) return null;
+  const scan = masked.slice(ap + o);
+  const lim = u - d;
+  MARKED_DEL_RDELIM.lastIndex = 0;
+  let s2;
+  while ((s2 = MARKED_DEL_RDELIM.exec(scan)) !== null && !(s2.index > lim)) {
+    const g = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
+    if (!g) continue;
+    const l0 = [...g].length;
+    if (l0 !== o) continue;
+    if (s2[3] || s2[4]) { p += l0; continue; }
+    p -= l0;
+    if (p > 0) continue;
+    const l = Math.min(l0, l0 + p);
+    const te = [...s2[0]][0].length;
+    const closerStart = ap + o + s2.index + te;
+    return {
+      type: 'del', ch: '~',
+      start: ap, end: closerStart + l, use: o,
+      innerStart: ap + o, innerEnd: closerStart,
+      closerStart, closerLen: l, openerLen: o, attLen: o,
+    };
+  }
+  return null;
+}
+
+// marked's `r` (previous-char) for the run whose node is `node` in the
+// current node list: the last char of the preceding text, walking back past
+// text/run nodes ending in `_` (those never update r); a link/code/html/
+// wrap node resets it to ''.
+function markedPrevChar(nodes, node) {
+  let idx = nodes.indexOf(node);
+  for (let j = idx - 1; j >= 0; j--) {
+    const nd = nodes[j];
+    if (nd.k === 0) {
+      if (!nd.s.length) continue;
+      const last = nd.s[nd.s.length - 1];
+      if (last === '_') continue;
+      return last;
+    }
+    if (nd.k === 6) {
+      if (nd.ch === '_') continue;
+      return nd.ch;
+    }
+    return '';
+  }
+  return '';
+}
+
+// Resolve the runs in `runs` (document order, linked via prev/next) inside
+// `nodes` for inline source `src` (masked source `masked`, fe limits `fe`).
+// Recursive: a matched span re-resolves its inner runs on the inner text.
+function markedResolve(nodes, runs, src, masked, fe, refs) {
+  if (!runs.length) return;
+  for (let i = 0; i < runs.length; i++) {
+    runs[i].prev = i > 0 ? runs[i - 1] : null;
+    runs[i].next = i + 1 < runs.length ? runs[i + 1] : null;
+  }
+  const removeRun = (d) => {
     if (d.prev) d.prev.next = d.next;
     if (d.next) d.next.prev = d.prev;
-    d.prev = null;
-    d.next = null;
+    d.prev = null; d.next = null;
   };
-  const removeBetween = (opener, closer) => {
-    let d = opener.next;
-    while (d && d !== closer) {
-      const nx = d.next;
-      removeDelim(d);
-      d = nx;
-    }
-  };
-  let cur = delims[0];
+  let cur = runs[0];
   while (cur) {
-    if (cur.canClose && cur.n > 0) {
-      let opener = cur.prev;
-      let found = null;
-      const limit = bottom.has(bottomKey(cur)) ? bottom.get(bottomKey(cur)) : null;
-      // NOTE: no old_closer guard here — commonmark.js only checks the
-      // openers_bottom limit (a previous closer can still be an opener)
-      while (opener && opener !== limit) {
-        // the odd-match rule (mod 3) applies to * and _ (CommonMark
-        // emphasis) and to ~ (GFM del behaves like * here)
-        const oddMatch =
-          (cur.canOpen || opener.canClose) &&
-          cur.orig % 3 !== 0 &&
-          (opener.orig + cur.orig) % 3 === 0;
-        // marked's emStrong prefers a strong: a single `*` closer must
-        // not steal one delim from a `**` opener when a later `**`
-        // closer can form the strong with it (doc-01/11/26/30:
-        // `**a *b*c* d**` keeps the outer strong, the lone `*` stays
-        // literal). Only when the opener has exactly 2 delims (just
-        // enough for the strong); a 3-delim opener has room for both an
-        // em and the strong (cm-430: `***foo* bar**`).
-        let stealsStrong = false;
-        if (cur.n === 1 && opener.n === 2 && opener.ch === cur.ch && opener.canOpen) {
-          let d = cur.next;
-          while (d) {
-            if (d.ch === cur.ch && d.canClose && d.n >= 2) { stealsStrong = true; break; }
-            d = d.next;
-          }
-        }
-        if (opener.ch === cur.ch && opener.canOpen && opener.n > 0 && !oddMatch && !isBlocked(opener, cur) && !stealsStrong) {
-          found = opener;
-          break;
-        }
-        opener = opener.prev;
-      }
-      if (found) {
-        // ~ always renders <del> (1 or 2 tildes, like em/strong counts)
-        const use = found.n >= 2 && cur.n >= 2 ? 2 : 1;
-        const tag = cur.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-        matchedClosers.push({ ch: cur.ch, endPos: cur.pos + use, count: use, openerPrecededByWs: found.pos > 0 && isUniSpace(src[found.pos - 1]) });
-        removeBetween(found, cur);
-        const oi = nodes.indexOf(found.node);
-        const ci = nodes.indexOf(cur.node);
-        const kids = nodes.slice(oi + 1, ci);
-        const wrap = { k: 7, tag, kids };
-        found.n -= use;
-        cur.n -= use;
-        const replacement = [];
-        if (found.n > 0) { found.node.n = found.n; replacement.push(found.node); }
-        replacement.push(wrap);
-        if (cur.n > 0) { cur.node.n = cur.n; replacement.push(cur.node); }
-        nodes.splice(oi, ci - oi + 1, ...replacement);
-        if (found.n === 0) removeDelim(found);
-        if (cur.n === 0) {
-          const nx = cur.next;
-          removeDelim(cur);
-          cur = nx;
-        }
-        // a closer with delims left is re-processed (same cur)
-      } else {
-        const prev = cur.prev;
-        const nx = cur.next;
-        if (!cur.canOpen) removeDelim(cur);
-        bottom.set(bottomKey(cur), prev);
-        cur = nx;
-      }
-    } else {
-      cur = cur.next;
+    const ch = cur.ch;
+    const prevChar = markedPrevChar(nodes, cur.node);
+    let match = null;
+    let attLen = 0;
+    for (let k = cur.n; k >= 1; k--) {
+      const ap = cur.pos + (cur.n - k);
+      const pc = k === cur.n ? prevChar : (ch === '_' ? prevChar : ch);
+      const m = ch === '~'
+        ? markedDel(src, masked, fe, ap, pc)
+        : markedEmStrong(src, masked, fe, ap, pc);
+      if (m) { match = m; attLen = k; break; }
     }
+    if (!match) { cur = cur.next; continue; }
+    // find the closer run (must be a live run at closerStart, same char)
+    let closer = null;
+    for (let d = cur.next; d; d = d.next) {
+      if (d.pos === match.closerStart && d.ch === ch) { closer = d; break; }
+      if (d.pos > match.closerStart) break;
+    }
+    if (!closer) { cur = cur.next; continue; }
+    const use = match.use;
+    const closerUsed = match.closerLen;
+    const prefixLen = cur.n - attLen;
+    const innerOpenerLeft = attLen - use;
+    const innerCloserLeft = closerUsed - use;
+    const closerRemain = closer.n - closerUsed;
+    const innerSrc = src.slice(match.innerStart, match.innerEnd);
+    const oi = nodes.indexOf(cur.node);
+    const ci = nodes.indexOf(closer.node);
+    // inner runs: leftover opener + runs between opener and closer + leftover closer
+    const innerRuns = [];
+    const innerNodes = nodes.slice(oi + 1, ci);
+    if (innerOpenerLeft > 0) {
+      const nd = { k: 6, ch, n: innerOpenerLeft };
+      innerNodes.unshift(nd);
+      innerRuns.push({ node: nd, ch, n: innerOpenerLeft, orig: innerOpenerLeft, pos: 0 });
+    }
+    for (let d = cur.next; d && d !== closer; d = d.next) {
+      innerRuns.push({ node: d.node, ch: d.ch, n: d.n, orig: d.orig, pos: d.pos - match.innerStart });
+    }
+    if (innerCloserLeft > 0) {
+      const nd = { k: 6, ch, n: innerCloserLeft };
+      innerNodes.push(nd);
+      innerRuns.push({ node: nd, ch, n: innerCloserLeft, orig: innerCloserLeft, pos: innerSrc.length - innerCloserLeft });
+    }
+    // resolve the inner content (marked's recursive inlineTokens)
+    const innerMasked = markedMask(innerSrc, refs);
+    const innerFe = markedFe(innerMasked);
+    markedResolve(innerNodes, innerRuns, innerSrc, innerMasked, innerFe, refs);
+    const tag = match.type === 'del' ? 'del' : match.type;
+    const wrap = { k: 7, tag, kids: innerNodes };
+    const replacement = [];
+    if (prefixLen > 0) replacement.push({ k: 0, s: ch.repeat(prefixLen) });
+    replacement.push(wrap);
+    // remove the runs between opener and closer FIRST (closer is still in
+    // the list as the loop sentinel); removing closer first would let the
+    // loop run past it and delete every later run.
+    {
+      let d = cur.next;
+      while (d && d !== closer) { const nx = d.next; removeRun(d); d = nx; }
+    }
+    removeRun(cur);
+    let nextCur;
+    if (closerRemain > 0) {
+      const nd = { k: 6, ch, n: closerRemain };
+      replacement.push(nd);
+      closer.node = nd;
+      closer.pos = match.closerStart + closerUsed;
+      closer.n = closerRemain;
+      closer.orig = closerRemain;
+      nextCur = closer;
+    } else {
+      nextCur = closer.next;
+      removeRun(closer);
+    }
+    nodes.splice(oi, ci - oi + 1, ...replacement);
+    cur = nextCur;
   }
+}
+
+// Replace the CommonMark delimiter stack: marked's emStrong/del over the
+// collected runs, with marked's masking and fe limits.
+function resolveEmphasis(nodes, delims, src, refs) {
+  if (!delims.length) return;
+  const masked = markedMask(src, refs);
+  const fe = markedFe(masked);
+  markedResolve(nodes, delims, src, masked, fe, refs);
 }
 
 // Render inline nodes to plain text (image alt text): no tags, numeric
