@@ -1264,6 +1264,31 @@ function inlineNodes(src, refs) {
         } else p++;
       }
       if (closed === -1) { i = j; continue; }
+      // A code span opened inside a bracket swallows the ']' only when
+      // no backtick run at all sits before that ']' (cm-342: the single
+      // backtick after /foo is the span's closer past the ']', so the
+      // '[' never forms a link). If a backtick run sits before the ']'
+      // but the exact-length closer lies past it (doc-09: a lone
+      // backtick after url), the span is unclosed at the ']' and the
+      // link forms — the backticks stay literal.
+      if (brackets.length > 0) {
+        let q = j;
+        let firstClose = -1;
+        let backtickBefore = false;
+        while (q < n) {
+          if (src[q] === '\\' && q + 1 < n) { q += 2; continue; }
+          if (src[q] === '`') { backtickBefore = true; }
+          if (src[q] === ']') { firstClose = q; break; }
+          q++;
+        }
+        if (backtickBefore && firstClose !== -1 && closed > firstClose) {
+          // the backticks up to the ']' are literal text; the ']' still
+          // closes the bracket, so jump to it (the text is flushed as
+          // literal when the next node is pushed)
+          i = firstClose;
+          continue;
+        }
+      }
       let content = src.slice(j, closed);
       content = content.replace(/\n/g, ' ');
       if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && content.trim() !== '') {
